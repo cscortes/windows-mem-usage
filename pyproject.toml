@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "winmem"
+version = "1.0.0"
+description = "List programs on Windows 11 and their memory usage."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["psutil>=5.9"]
+
+[project.scripts]
+list-programs = "winmem.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["winmem*"]
