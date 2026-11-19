@@ -88,6 +88,46 @@ class RenderTests(unittest.TestCase):
         self.assertNotIn("\033", report)
         self.assertIn("Executable", report)
 
+    def test_running_total_adds_private_ram_in_the_order_shown(self):
+        rows = [
+            process(pid=1, name="chrome.exe", private_working_set=1024**3),
+            process(pid=2, name="explorer.exe", private_working_set=512 * 1024**2, percent=4.0),
+            process(pid=3, name="hidden.exe", private_working_set=None, percent=1.0),
+        ]
+        report = render_process_report(
+            WINDOWS,
+            rows,
+            grouped=False,
+            matched=3,
+            matched_processes=3,
+            matched_rss=sum(row.rss for row in rows),
+            matched_private_ws=1024**3 + 512 * 1024**2,
+            matched_private_rss=None,
+            skipped=0,
+            sort_field="private",
+            truncated=False,
+            verbose=False,
+            style=Style(plain=True),
+        )
+        header = next(line for line in report.splitlines() if "Private WS" in line and "Running total" in line)
+        self.assertLess(header.index("Private WS"), header.index("Running total"))
+        self.assertLess(header.index("Running total"), header.index("Working set"))
+        self.assertIn("1.5 GB", report)
+        self.assertIn(
+            "Running total of private RAM after the last process is 1.5 GB. RAM in use is 10.0 GB.",
+            report,
+        )
+        text = process_csv(rows, grouped=False)
+        parsed = list(csv.reader(io.StringIO(text)))
+        self.assertEqual(parsed[1][-1], str(1024**3))
+        self.assertEqual(parsed[2][-1], str(1024**3 + 512 * 1024**2))
+        self.assertEqual(parsed[3][-1], parsed[2][-1])
+        payload = json.loads(
+            process_json(WINDOWS, rows, grouped=False, matched=3, skipped=0, sort_field="private")
+        )
+        self.assertEqual(payload["running_total_of"], "private_working_set")
+        self.assertEqual(payload["rows"][2]["running_total_bytes"], 1024**3 + 512 * 1024**2)
+
     def test_linux_table_uses_rss(self):
         row = process(
             name="python",
@@ -200,6 +240,7 @@ class RenderTests(unittest.TestCase):
                 "percent_ram",
                 "cpu_percent",
                 "exe",
+                "running_total_bytes",
             ],
         )
         self.assertEqual(rows[1][0], "10")

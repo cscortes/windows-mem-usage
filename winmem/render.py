@@ -136,7 +136,7 @@ def render_process_report(
         )
         if rows and columns:
             if ledger is not None:
-                lines.append("Processes")
+                lines.append("Programs" if grouped else "Processes")
                 lines.append("")
             lines.extend(_table(columns, rows, style=style))
         else:
@@ -229,8 +229,10 @@ def process_json(
         "matched": matched,
         "shown": len(rows),
         "notes": _json_notes(host),
-        "rows": [_group_json(row) if grouped else _process_json(row) for row in rows],
+        "rows": _rows_with_running_total(rows, grouped=grouped),
     }
+    if rows:
+        payload["running_total_of"] = usage_attr(rows)
     if ledger is not None:
         payload["ledger"] = _ledger_json(ledger)
     return json.dumps(payload, indent=2) + "\n"
@@ -279,9 +281,10 @@ def process_csv(rows: Sequence[object], *, grouped: bool) -> str:
                 "private_rss_bytes",
                 "percent_ram",
                 "cpu_percent",
+                "running_total_bytes",
             ]
         )
-        for row in rows:
+        for row, total in zip(rows, running_totals(rows, usage_attr(rows))):
             writer.writerow(
                 [
                     row.name,
@@ -294,6 +297,7 @@ def process_csv(rows: Sequence[object], *, grouped: bool) -> str:
                     _blank(row.private_rss),
                     _percent_csv(row.percent),
                     _blank_number(row.cpu_percent),
+                    total,
                 ]
             )
     else:
@@ -310,9 +314,10 @@ def process_csv(rows: Sequence[object], *, grouped: bool) -> str:
                 "percent_ram",
                 "cpu_percent",
                 "exe",
+                "running_total_bytes",
             ]
         )
-        for row in rows:
+        for row, total in zip(rows, running_totals(rows, usage_attr(rows))):
             writer.writerow(
                 [
                     row.pid,
@@ -326,6 +331,7 @@ def process_csv(rows: Sequence[object], *, grouped: bool) -> str:
                     _percent_csv(row.percent),
                     _blank_number(row.cpu_percent),
                     row.exe or "",
+                    total,
                 ]
             )
     return buffer.getvalue()
@@ -417,6 +423,9 @@ def _process_columns(
         columns.append(resident_column)
         if private_column is not None:
             columns.append(private_column)
+    if rows:
+        summed = _usage_header(rows, resident)
+        _insert_after(columns, summed, _running_total_column(rows, style))
     columns.append(Column("%RAM", "right", lambda row: format_percent(row.percent, missing=style.missing)))
     if _any(rows, "cpu_percent"):
         columns.append(Column("CPU%", "right", lambda row: format_cpu(row.cpu_percent, missing=style.missing)))
@@ -753,6 +762,9 @@ def _process_footer(
         head += f"{style.sep}{skipped} inaccessible"
     head += f"{style.sep}sorted by {sort_label}"
     lines = [head]
+    running = _running_total_note(host, rows, grouped=grouped, truncated=truncated, style=style)
+    if running:
+        lines.append(running)
     if with_ledger:
         return lines
     if truncated:
@@ -851,6 +863,93 @@ def _host_json(host: HostInfo) -> dict:
         "memory_used_bytes": host.used,
         "memory_percent": host.percent,
     }
+
+
+def usage_attr(rows: Sequence[object]) -> str:
+    """The memory column a running total adds up.
+
+    On Windows that is the private working set, which is Task Manager's Memory
+    column. Elsewhere it is private resident memory when we have it.
+    """
+    if _any(rows, "private_working_set"):
+        return "private_working_set"
+    if _any(rows, "private_rss"):
+        return "private_rss"
+    return "rss"
+
+
+def running_totals(rows: Sequence[object], attr: str) -> list[int]:
+    """Cumulative memory, in the order the rows are shown. A blank cell adds nothing."""
+    total = 0
+    totals: list[int] = []
+    for row in rows:
+        value = getattr(row, attr, None)
+        if value is not None:
+            total += max(int(value), 0)
+        totals.append(total)
+    return totals
+
+
+def _usage_header(rows: Sequence[object], resident: str) -> str:
+    attr = usage_attr(rows)
+    if attr == "rss":
+        return resident
+    return _private_header(rows) or resident
+
+
+def _running_total_column(rows: Sequence[object], style: Style) -> Column:
+    totals = {id(row): amount for row, amount in zip(rows, running_totals(rows, usage_attr(rows)))}
+    return Column(
+        "Running total",
+        "right",
+        lambda row, totals=totals: format_bytes(totals[id(row)], missing=style.missing),
+        emphasize=True,
+    )
+
+
+def _insert_after(columns: list[Column], header: str, column: Column) -> None:
+    for index, existing in enumerate(columns):
+        if existing.header == header:
+            columns.insert(index + 1, column)
+            return
+    columns.append(column)
+
+
+def _running_total_note(
+    host: HostInfo,
+    rows: Sequence[object],
+    *,
+    grouped: bool,
+    truncated: bool,
+    style: Style,
+) -> str | None:
+    if not rows:
+        return None
+    attr = usage_attr(rows)
+    total = running_totals(rows, attr)[-1]
+    shown = format_bytes(total, missing=style.missing)
+    in_use = format_bytes(host.used, missing=style.missing)
+    label = {
+        "private_working_set": "private RAM",
+        "private_rss": "private RAM",
+        "rss": "resident memory",
+    }[attr]
+    if truncated:
+        return f"Running total of {label} for the rows shown is {shown}. RAM in use is {in_use}."
+    noun = "program" if grouped else "process"
+    return f"Running total of {label} after the last {noun} is {shown}. RAM in use is {in_use}."
+
+
+def _rows_with_running_total(rows: Sequence[object], *, grouped: bool) -> list[dict]:
+    if not rows:
+        return []
+    totals = running_totals(rows, usage_attr(rows))
+    encoded = []
+    for row, total in zip(rows, totals):
+        item = _group_json(row) if grouped else _process_json(row)
+        item["running_total_bytes"] = total
+        encoded.append(item)
+    return encoded
 
 
 def _process_json(row: object) -> dict:

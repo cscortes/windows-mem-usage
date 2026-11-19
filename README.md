@@ -62,6 +62,7 @@ A live run fills those lines from the computer it is started on. The process lis
 | --- | --- |
 | Working set | Physical memory the process has mapped, including shared DLLs and files. On Linux and macOS this column is named RSS. |
 | Private WS | Private working set, the Windows 11 Task Manager Memory column. Blank when Windows will not let this program query that process. |
+| Running total | Private RAM added up through the current row, in the order the table is showing. The last row is the sum of that column. A blank private cell adds nothing. |
 | Private RSS | On Linux and macOS, resident memory minus pages shared with other processes. |
 | %RAM | Working set (or RSS) divided by installed RAM. |
 | CPU% | Processor time over about a tenth of a second. A process can go past 100% when it uses more than one core. |
@@ -69,7 +70,7 @@ A live run fills those lines from the computer it is started on. The process lis
 
 Units are binary, matching Task Manager: 1 KB is 1024 bytes.
 
-The breakdown above the process list is the part that adds up to RAM in use. The process list is only the first line of that breakdown.
+The breakdown above the process list is the part that adds up to RAM in use. The process list is only the first line of that breakdown. The Running total column is that first line being added, row by row. The line under the table states that total next to RAM in use. `--group` makes each row a program name before the running total continues.
 
 `--verbose` adds status, the executable path, and private bytes. Private bytes are the commit charge, which can be larger than RAM because committed memory may sit in the page file. Commit charge is printed under the breakdown and is not part of the 13 GB.
 
