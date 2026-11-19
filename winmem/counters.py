@@ -9,6 +9,7 @@ can be missing; the ledger still adds up by putting the unknown part in
 from __future__ import annotations
 
 import ctypes
+import os
 import sys
 from pathlib import Path
 
@@ -38,6 +39,18 @@ def parse_meminfo(text: str) -> dict[str, int]:
     return values
 
 
+def balloon_bytes(inflate: int, deflate: int, page_size: int) -> int:
+    """RAM the hypervisor is holding, from the balloon event counters in /proc/vmstat."""
+    pages = max(0, int(inflate) - int(deflate))
+    return pages * max(int(page_size), 0)
+
+
+def file_cache_in_use(cached: int, buffers: int, available: int, free: int) -> int:
+    """File cache that is not already counted as available memory."""
+    reclaimable = max(0, int(available) - int(free))
+    return max(0, int(cached) + int(buffers) - reclaimable)
+
+
 def _linux_counters() -> dict[str, int]:
     text = Path("/proc/meminfo").read_text(encoding="utf-8", errors="replace")
     info = parse_meminfo(text)
@@ -50,7 +63,28 @@ def _linux_counters() -> dict[str, int]:
     for field, key in mapping.items():
         if key in info and info[key] >= 0:
             counters[field] = info[key]
+    events = _vmstat()
+    if "balloon_inflate" in events:
+        page = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+        held = balloon_bytes(events.get("balloon_inflate", 0), events.get("balloon_deflate", 0), page or 4096)
+        if held > 0:
+            counters["balloon"] = held
+    needed = ("Cached", "Buffers", "MemAvailable", "MemFree")
+    if all(key in info for key in needed):
+        held_cache = file_cache_in_use(info["Cached"], info["Buffers"], info["MemAvailable"], info["MemFree"])
+        if held_cache > 0:
+            counters["system_cache_resident"] = held_cache
     return counters
+
+
+def _vmstat() -> dict[str, int]:
+    values: dict[str, int] = {}
+    text = Path("/proc/vmstat").read_text(encoding="utf-8", errors="replace")
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].lstrip("-").isdigit():
+            values[parts[0]] = int(parts[1])
+    return values
 
 
 def _windows_counters() -> dict[str, int]:

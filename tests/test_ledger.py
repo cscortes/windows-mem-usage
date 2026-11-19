@@ -5,7 +5,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from winmem.collect import collect_snapshot
-from winmem.counters import parse_meminfo
+from winmem.counters import balloon_bytes, file_cache_in_use, parse_meminfo
 from winmem.ledger import MemoryFacts, build_ledger, facts_from_snapshot
 from winmem.models import HostInfo, ProcessRow, Snapshot
 from winmem.render import Style, render_process_report
@@ -128,6 +128,26 @@ class LedgerTests(unittest.TestCase):
         self.assertNotIn("PID", report)
         self.assertTrue(ledger.closes())
 
+    def test_balloon_is_its_own_line_and_not_the_unnamed_remainder(self):
+        ledger = build_ledger(facts(system="Linux", balloon=10 * GB, process_private=GB // 2, process_count=38))
+        self.assertTrue(ledger.closes())
+        by_key = {line.key: line.amount for line in ledger.in_use_lines}
+        self.assertEqual(by_key["balloon"], 10 * GB)
+        self.assertEqual(by_key["other"], 13 * GB - 10 * GB - GB // 2)
+
+    def test_balloon_that_overshoots_the_room_left_is_still_named(self):
+        ledger = build_ledger(facts(system="Linux", process_private=4 * GB, balloon=10 * GB))
+        self.assertTrue(ledger.closes())
+        balloon = next(line for line in ledger.in_use_lines if line.key == "balloon")
+        self.assertEqual(balloon.amount, 9 * GB)
+        self.assertEqual(ledger.balloon, 10 * GB)
+
+    def test_balloon_pages_and_file_cache_math(self):
+        self.assertEqual(balloon_bytes(2621440, 0, 4096), 10 * GB)
+        self.assertEqual(balloon_bytes(5, 2, 4096), 3 * 4096)
+        self.assertEqual(file_cache_in_use(cached=500, buffers=100, available=800, free=400), 200)
+        self.assertEqual(file_cache_in_use(cached=100, buffers=0, available=800, free=400), 0)
+
     def test_meminfo_parser_uses_binary_kilobytes(self):
         info = parse_meminfo(
             "\n".join(
@@ -150,6 +170,11 @@ class LedgerTests(unittest.TestCase):
         self.assertGreater(ledger.total, 0)
         self.assertTrue(ledger.closes())
         self.assertEqual(ledger.in_use + ledger.available, snapshot.host.total)
+        if snapshot.host.system == "Linux" and ledger.balloon:
+            named = {line.key for line in ledger.in_use_lines}
+            self.assertIn("balloon", named)
+            other = next((line.amount for line in ledger.in_use_lines if line.key == "other"), 0)
+            self.assertLess(other, ledger.balloon)
 
 
 class SnapshotLedgerTests(unittest.TestCase):

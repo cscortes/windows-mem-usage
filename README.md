@@ -10,6 +10,8 @@ The Memory column in Task Manager is each process's private RAM. Three kinds of 
 
 Compressed RAM is often a process named Memory Compression. Task Manager sometimes nests it under System, so it is easy to miss while still being a large part of the 13 GB.
 
+On a Linux virtual machine, a huge "in use" remainder is usually the hypervisor balloon: RAM the host has taken back. It is not a process. The report names that line when the kernel reports a balloon.
+
 The same command works on Windows 10, Linux, and macOS.
 
 ## Run it

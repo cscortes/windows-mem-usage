@@ -609,6 +609,15 @@ def ledger_intro(ledger: Ledger, style: Style) -> list[str]:
 def ledger_followup(ledger: Ledger, style: Style) -> list[str]:
     missing = style.missing
     lines: list[str] = []
+    shown_balloon = next((line.amount for line in ledger.in_use_lines if line.key == "balloon"), None)
+    if ledger.balloon:
+        sentence = (
+            f"The hypervisor balloon is {format_bytes(ledger.balloon, missing=missing)}. "
+            "The host is holding that RAM, so it counts as in use and it belongs to no process."
+        )
+        if shown_balloon is not None and shown_balloon < ledger.balloon:
+            sentence += f" {format_bytes(shown_balloon, missing=missing)} of it fits on its own line."
+        lines.append(sentence)
     if ledger.working_set > 0:
         shown = format_bytes(ledger.working_set, missing=missing)
         if ledger.working_set > ledger.in_use:

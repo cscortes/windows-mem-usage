@@ -34,6 +34,7 @@ class MemoryFacts:
     kernel_stack: int | None = None
     page_tables: int | None = None
     unreclaimable_slab: int | None = None
+    balloon: int | None = None
     commit: int | None = None
     commit_limit: int | None = None
     installed: int | None = None
@@ -62,6 +63,7 @@ class Ledger:
     skipped_processes: int
     omitted: tuple[str, ...]
     available_was_scaled: bool
+    balloon: int | None = None
 
     def closes(self) -> bool:
         in_sum = sum(line.amount for line in self.in_use_lines)
@@ -106,6 +108,7 @@ def facts_from_snapshot(snapshot: Snapshot) -> MemoryFacts:
         kernel_stack=_counter(extra, "kernel_stack"),
         page_tables=_counter(extra, "page_tables"),
         unreclaimable_slab=_counter(extra, "unreclaimable_slab"),
+        balloon=_counter(extra, "balloon"),
         commit=_counter(extra, "commit"),
         commit_limit=_counter(extra, "commit_limit"),
         installed=_counter(extra, "installed"),
@@ -140,6 +143,7 @@ def build_ledger(facts: MemoryFacts) -> Ledger:
 
     candidates = (
         ("process_private", private_label, private, 10),
+        ("balloon", "Hypervisor balloon (RAM the host is holding)", facts.balloon, 15),
         ("modified", "Modified pages waiting to be written", facts.modified, 20),
         ("nonpaged_pool", "Non-paged pool (kernel RAM kept in memory)", facts.nonpaged_pool, 30),
         ("kernel_stack", "Kernel stacks", facts.kernel_stack, 40),
@@ -170,6 +174,7 @@ def build_ledger(facts: MemoryFacts) -> Ledger:
         skipped_processes=max(int(facts.skipped_processes), 0),
         omitted=tuple(omitted),
         available_was_scaled=scaled,
+        balloon=facts.balloon if facts.balloon is not None and facts.balloon > 0 else None,
     )
 
 
@@ -187,7 +192,13 @@ def _fit_in_use(budget: int, candidates: tuple[tuple[str, str, int | None, int],
         if amount <= 0:
             continue
         if amount > remaining:
-            omitted.append(label)
+            # The balloon is one allocation. Show the part that still fits
+            # instead of hiding the whole thing inside the unnamed remainder.
+            if key == "balloon" and remaining > 0:
+                lines.append(LedgerLine(key, label, remaining))
+                remaining = 0
+            else:
+                omitted.append(label)
             continue
         lines.append(LedgerLine(key, label, amount))
         remaining -= amount
