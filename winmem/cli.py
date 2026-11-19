@@ -30,6 +30,7 @@ from winmem.installed import (
     filter_installed,
     load_installed_programs,
 )
+from winmem.ledger import build_ledger, facts_from_snapshot
 from winmem.render import (
     Style,
     installed_csv,
@@ -46,14 +47,17 @@ _ALL_SORTS = tuple(sorted(set(PROCESS_SORTS) | set(GROUP_SORTS) | set(INSTALLED_
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "List running programs and how much memory they are using. "
-            "On Windows 11, Private WS is the private working set, which is "
-            "the Memory column in Task Manager. The same command works on "
-            "Windows 10, Linux, and macOS."
+            "Show where RAM in use goes, then list each program. "
+            "On Windows 11, Task Manager's Memory column is private RAM, so adding "
+            "it up is less than the in-use total. This report breaks that total "
+            "into pieces that add back up, including kernel memory and memory "
+            "not tied to one process. The same command works on Windows 10, "
+            "Linux, and macOS."
         ),
         epilog=(
             "examples:\n"
             "  list_programs.py\n"
+            "  list_programs.py --brief\n"
             "  list_programs.py --top 20\n"
             "  list_programs.py --group\n"
             "  list_programs.py --name chrome\n"
@@ -92,9 +96,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--sort",
-        default="memory",
+        default=None,
         choices=_ALL_SORTS,
-        help="Sort key. Memory, CPU, and size sorts start with the largest. Name sorts start at A.",
+        help=(
+            "Sort key. Memory, CPU, and size sorts start with the largest. Name sorts start at A. "
+            "The default is private RAM when that figure is available."
+        ),
+    )
+    parser.add_argument(
+        "--brief",
+        action="store_true",
+        help="Show only the breakdown of RAM in use, not each process.",
     )
     order = parser.add_mutually_exclusive_group()
     order.add_argument("--asc", action="store_true", help="Sort from low to high, or A to Z for names.")
@@ -155,7 +167,7 @@ def validate(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
         allowed = GROUP_SORTS
     else:
         allowed = PROCESS_SORTS
-    if args.sort not in allowed:
+    if args.sort is not None and args.sort not in allowed:
         names = ", ".join(allowed)
         parser.error(f"--sort {args.sort} is not available for this view (available: {names})")
 
@@ -197,6 +209,8 @@ def _render_once(args: argparse.Namespace, refreshed_at: str | None) -> str:
 
 
 def _render_processes(args: argparse.Namespace, snapshot, style: Style, refreshed_at: str | None) -> str:
+    sort_field = _effective_sort(args, snapshot)
+    ledger = build_ledger(facts_from_snapshot(snapshot))
     filtered = filter_processes(snapshot.rows, name=args.name, user=args.user)
     if args.group:
         working = group_rows(filtered, snapshot.host.total)
@@ -208,8 +222,8 @@ def _render_processes(args: argparse.Namespace, snapshot, style: Style, refreshe
     private_attr = choose_private_attr(working)
     ordered = sort_rows(
         working,
-        args.sort,
-        descending=_descending(args),
+        sort_field,
+        descending=_descending(args, sort_field),
         private_attr=private_attr,
     )
     visible = ordered[: args.top] if args.top else ordered
@@ -221,10 +235,13 @@ def _render_processes(args: argparse.Namespace, snapshot, style: Style, refreshe
             grouped=args.group,
             matched=len(working),
             skipped=snapshot.skipped,
-            sort_field=args.sort,
+            sort_field=sort_field,
+            ledger=ledger,
         )
     if args.csv:
         return process_csv(visible, grouped=args.group)
+    narrowed = bool(args.name or args.user or args.min_mb or args.running_only or args.top)
+    scope = "The breakdown above is the whole computer. The table below is the current filter." if narrowed else None
     return render_process_report(
         snapshot.host,
         visible,
@@ -235,11 +252,14 @@ def _render_processes(args: argparse.Namespace, snapshot, style: Style, refreshe
         matched_private_ws=sum_attr(working, "private_working_set"),
         matched_private_rss=sum_attr(working, "private_rss"),
         skipped=snapshot.skipped,
-        sort_field=args.sort,
+        sort_field=sort_field,
         truncated=bool(args.top) and len(visible) < len(working),
         verbose=args.verbose,
         style=style,
         refreshed_at=refreshed_at,
+        ledger=ledger,
+        brief=args.brief,
+        scope_note=scope,
     )
 
 
@@ -254,11 +274,12 @@ def _render_installed(args: argparse.Namespace, snapshot, style: Style, refreshe
         running_only=args.running_only,
         min_bytes=_mb_to_bytes(args.min_mb),
     )
+    sort_field = args.sort or "memory"
     private_attr = choose_private_attr(working)
     ordered = sort_rows(
         working,
-        args.sort,
-        descending=_descending(args),
+        sort_field,
+        descending=_descending(args, sort_field),
         private_attr=private_attr,
     )
     visible = ordered[: args.top] if args.top else ordered
@@ -269,7 +290,7 @@ def _render_installed(args: argparse.Namespace, snapshot, style: Style, refreshe
             matched=len(working),
             unmatched_processes=unmatched,
             skipped=snapshot.skipped,
-            sort_field=args.sort,
+            sort_field=sort_field,
         )
     if args.csv:
         return installed_csv(visible)
@@ -283,7 +304,7 @@ def _render_installed(args: argparse.Namespace, snapshot, style: Style, refreshe
         matched_rss=sum(row.rss for row in working),
         matched_private_ws=sum_attr(working, "private_working_set"),
         skipped=snapshot.skipped,
-        sort_field=args.sort,
+        sort_field=sort_field,
         truncated=bool(args.top) and len(visible) < len(working),
         verbose=args.verbose,
         style=style,
@@ -313,12 +334,22 @@ def _supports_unicode(stream) -> bool:
     return True
 
 
-def _descending(args: argparse.Namespace) -> bool:
+def _effective_sort(args: argparse.Namespace, snapshot) -> str:
+    if args.sort:
+        return args.sort
+    if snapshot.host.is_windows and any(row.private_working_set is not None for row in snapshot.rows):
+        return "private"
+    if any(row.private_rss is not None for row in snapshot.rows):
+        return "private"
+    return "memory"
+
+
+def _descending(args: argparse.Namespace, sort_field: str | None = None) -> bool:
     if args.asc:
         return False
     if args.desc:
         return True
-    return descending_by_default(args.sort)
+    return descending_by_default(sort_field or args.sort or "memory")
 
 
 def _mb_to_bytes(value: float) -> int:

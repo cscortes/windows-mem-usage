@@ -9,6 +9,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from winmem.collect import choose_private_attr
+from winmem.ledger import Ledger
 from winmem.models import HostInfo
 
 SORT_LABELS = {
@@ -112,31 +113,52 @@ def render_process_report(
     verbose: bool,
     style: Style,
     refreshed_at: str | None = None,
+    ledger: Ledger | None = None,
+    brief: bool = False,
+    scope_note: str | None = None,
 ) -> str:
-    legend = _resident_legend(host, rows)
-    lines = _header(host, style, legend, refreshed_at)
-    columns = _process_columns(host, rows, grouped=grouped, verbose=verbose, style=style)
-    if rows and columns:
-        lines.extend(_table(columns, rows, style=style))
-    else:
-        lines.append("No running programs matched.")
-    lines.append("")
-    lines.extend(
-        _process_footer(
+    legend = "" if ledger is not None else _resident_legend(host, rows)
+    lines = _header(host, style, legend, refreshed_at, titled=ledger is not None)
+    if ledger is not None:
+        lines.extend(render_ledger(ledger, style))
+        lines.append("")
+    if not brief:
+        if scope_note:
+            lines.append(scope_note)
+            lines.append("")
+        columns = _process_columns(
             host,
             rows,
             grouped=grouped,
-            matched=matched,
-            matched_processes=matched_processes,
-            matched_rss=matched_rss,
-            matched_private_ws=matched_private_ws,
-            matched_private_rss=matched_private_rss,
-            skipped=skipped,
-            sort_field=sort_field,
-            truncated=truncated,
+            verbose=verbose,
             style=style,
+            sort_field=sort_field,
         )
-    )
+        if rows and columns:
+            if ledger is not None:
+                lines.append("Processes")
+                lines.append("")
+            lines.extend(_table(columns, rows, style=style))
+        else:
+            lines.append("No running programs matched.")
+        lines.append("")
+        lines.extend(
+            _process_footer(
+                host,
+                rows,
+                grouped=grouped,
+                matched=matched,
+                matched_processes=matched_processes,
+                matched_rss=matched_rss,
+                matched_private_ws=matched_private_ws,
+                matched_private_rss=matched_private_rss,
+                skipped=skipped,
+                sort_field=sort_field,
+                truncated=truncated,
+                style=style,
+                with_ledger=ledger is not None,
+            )
+        )
     return _finish(lines)
 
 
@@ -197,6 +219,7 @@ def process_json(
     matched: int,
     skipped: int,
     sort_field: str,
+    ledger: Ledger | None = None,
 ) -> str:
     payload = {
         "host": _host_json(host),
@@ -208,6 +231,8 @@ def process_json(
         "notes": _json_notes(host),
         "rows": [_group_json(row) if grouped else _process_json(row) for row in rows],
     }
+    if ledger is not None:
+        payload["ledger"] = _ledger_json(ledger)
     return json.dumps(payload, indent=2) + "\n"
 
 
@@ -345,7 +370,15 @@ def installed_csv(rows: Sequence[object]) -> str:
     return buffer.getvalue()
 
 
-def _process_columns(host: HostInfo, rows: Sequence[object], *, grouped: bool, verbose: bool, style: Style) -> list[Column]:
+def _process_columns(
+    host: HostInfo,
+    rows: Sequence[object],
+    *,
+    grouped: bool,
+    verbose: bool,
+    style: Style,
+    sort_field: str = "memory",
+) -> list[Column]:
     resident = "Working set" if host.is_windows else "RSS"
     columns: list[Column] = []
     if not grouped:
@@ -362,25 +395,28 @@ def _process_columns(host: HostInfo, rows: Sequence[object], *, grouped: bool, v
     )
     if grouped:
         columns.append(Column("Processes", "right", lambda row: str(row.process_count)))
-    columns.append(
-        Column(
-            resident,
-            "right",
-            lambda row: format_bytes(row.rss, missing=style.missing),
-            emphasize=True,
-        )
+    resident_column = Column(
+        resident,
+        "right",
+        lambda row: format_bytes(row.rss, missing=style.missing),
+        emphasize=True,
     )
     private_header = _private_header(rows)
+    private_column = None
     if private_header is not None:
         attr = choose_private_attr(rows)
-        columns.append(
-            Column(
-                private_header,
-                "right",
-                lambda row, attr=attr: format_bytes(getattr(row, attr), missing=style.missing),
-                emphasize=True,
-            )
+        private_column = Column(
+            private_header,
+            "right",
+            lambda row, attr=attr: format_bytes(getattr(row, attr), missing=style.missing),
+            emphasize=True,
         )
+    if sort_field == "private" and private_column is not None:
+        columns.extend((private_column, resident_column))
+    else:
+        columns.append(resident_column)
+        if private_column is not None:
+            columns.append(private_column)
     columns.append(Column("%RAM", "right", lambda row: format_percent(row.percent, missing=style.missing)))
     if _any(rows, "cpu_percent"):
         columns.append(Column("CPU%", "right", lambda row: format_cpu(row.cpu_percent, missing=style.missing)))
@@ -514,7 +550,152 @@ def _table(columns: Sequence[Column], rows: Sequence[object], *, style: Style) -
     return lines
 
 
-def _header(host: HostInfo, style: Style, legend: str, refreshed_at: str | None) -> list[str]:
+def render_ledger(ledger: Ledger, style: Style) -> list[str]:
+    """Explain why a process list does not add up to RAM in use, then show the sum."""
+    lines = list(ledger_intro(ledger, style))
+    if any(line.key == "process_private" for line in ledger.in_use_lines):
+        if ledger.system == "Windows":
+            lines.append("The first line is the Memory column added up. The lines under it are in-use RAM that column does not show.")
+        else:
+            lines.append("The first line is the private part of every process, added up. The lines under it are the rest of the RAM in use.")
+    lines.append("")
+    lines.append(f"Where the {format_bytes(ledger.in_use, missing=style.missing)} in use goes")
+    lines.extend(_ledger_block(ledger.in_use_lines, "In use", ledger.in_use, style))
+    lines.append("These lines add up to RAM in use.")
+    lines.append("")
+    available = format_bytes(ledger.available, missing=style.missing)
+    split = [line for line in ledger.available_lines if line.key != "available"]
+    if not split:
+        lines.append(f"The other {available} is available.")
+    else:
+        lines.append(f"The other {available} is available")
+        if any(line.key == "standby" for line in ledger.available_lines):
+            lines.append("Standby cache can be given to a program immediately. It is available, not in use.")
+        lines.extend(_ledger_block(ledger.available_lines, "Available", ledger.available, style))
+    lines.extend(ledger_followup(ledger, style))
+    return lines
+
+
+def ledger_intro(ledger: Ledger, style: Style) -> list[str]:
+    used = format_bytes(ledger.in_use, missing=style.missing)
+    total = format_bytes(ledger.total, missing=style.missing)
+    if ledger.system == "Windows":
+        return [
+            f"Windows reports {used} in use out of {total}.",
+            "The Memory column is each process's private RAM. Shared DLLs, the kernel, and pages",
+            "not assigned to one process are inside that in-use total and absent from every row,",
+            "so the column adds up short. Adding working sets instead counts each shared DLL",
+            "again for every process, so that sum runs high.",
+            "Compressed RAM is often a process named Memory Compression. Task Manager sometimes",
+            "nests it under System, which makes it easy to miss.",
+        ]
+    return [
+        f"This computer reports {used} in use out of {total}.",
+        "Each process row is that process's own resident memory. Shared pages are left out",
+        "or counted once per process, so adding the rows does not produce the in-use figure.",
+        "The lines below are the whole computer, and they add up to it.",
+    ]
+
+
+def ledger_followup(ledger: Ledger, style: Style) -> list[str]:
+    missing = style.missing
+    lines: list[str] = []
+    if ledger.working_set > 0:
+        shown = format_bytes(ledger.working_set, missing=missing)
+        if ledger.working_set > ledger.in_use:
+            lines.append(
+                f"Adding every working set gives {shown}. "
+                "That is higher than RAM in use because shared memory is counted once for each process that maps it."
+            )
+        else:
+            lines.append(
+                f"Adding every working set gives {shown}. "
+                "That is still not RAM in use, because shared pages and kernel memory are not one process row."
+            )
+    shown = next((line.amount for line in ledger.in_use_lines if line.key == "process_private"), None)
+    if shown is not None and ledger.process_private_measured > shown:
+        lines.append(
+            f"Process private RAM measured {format_bytes(ledger.process_private_measured, missing=missing)}, "
+            f"above RAM in use. The line uses {format_bytes(shown, missing=missing)} so the lines can add up."
+        )
+    if ledger.system == "Windows" and ledger.commit is not None:
+        if ledger.commit_limit:
+            promised = (
+                f"Commit charge is {format_bytes(ledger.commit, missing=missing)} "
+                f"of {format_bytes(ledger.commit_limit, missing=missing)}."
+            )
+        else:
+            promised = f"Commit charge is {format_bytes(ledger.commit, missing=missing)}."
+        lines.append(promised + " That is memory Windows has promised, including the page file. It is not RAM in use.")
+    if ledger.hardware_reserved:
+        lines.append(
+            f"Hardware reserved is {format_bytes(ledger.hardware_reserved, missing=missing)}, "
+            f"outside the {format_bytes(ledger.total, missing=missing)} the operating system is managing."
+        )
+    if ledger.skipped_processes:
+        noun = "process" if ledger.skipped_processes == 1 else "processes"
+        lines.append(
+            f"{ledger.skipped_processes} {noun} could not be queried. "
+            "RAM they hold is inside Other memory in use."
+        )
+    if ledger.omitted:
+        lines.append(
+            "These measurements overlap RAM already listed, so they are not separate lines: "
+            + "; ".join(ledger.omitted)
+            + "."
+        )
+    if ledger.available_was_scaled:
+        lines.append("Standby and free measured larger than available, so those lines are fitted to the available total.")
+    return lines
+
+
+def _ledger_block(entries: Sequence[object], total_label: str, total: int, style: Style) -> list[str]:
+    rows = [(entry.label, entry.amount) for entry in entries]
+    rows.append((total_label, total))
+    label_width = max((len(label) for label, _amount in rows), default=len(total_label))
+    amount_width = max(len(format_bytes(amount, missing=style.missing)) for _label, amount in rows)
+    body = []
+    for label, amount in rows[:-1]:
+        body.append(_ledger_row(label, amount, label_width, amount_width, style, bold=False))
+    if rows[:-1]:
+        body.append("  " + "-" * (label_width + 2 + amount_width))
+    body.append(_ledger_row(total_label, total, label_width, amount_width, style, bold=True))
+    return body
+
+
+def _ledger_row(label: str, amount: int, label_width: int, amount_width: int, style: Style, *, bold: bool) -> str:
+    text = f"  {label.ljust(label_width)}  {format_bytes(amount, missing=style.missing).rjust(amount_width)}"
+    if bold and style.color:
+        return f"\033[1m{text}\033[0m"
+    return text
+
+
+def _ledger_json(ledger: Ledger) -> dict:
+    return {
+        "total_bytes": ledger.total,
+        "in_use_bytes": ledger.in_use,
+        "available_bytes": ledger.available,
+        "closes": ledger.closes(),
+        "in_use": [{"key": line.key, "label": line.label, "bytes": line.amount} for line in ledger.in_use_lines],
+        "available": [
+            {"key": line.key, "label": line.label, "bytes": line.amount} for line in ledger.available_lines
+        ],
+        "working_set_bytes": ledger.working_set,
+        "process_private_bytes": ledger.process_private_measured,
+        "commit_bytes": ledger.commit,
+        "commit_limit_bytes": ledger.commit_limit,
+        "hardware_reserved_bytes": ledger.hardware_reserved,
+        "notes": ledger_intro(ledger, Style(plain=True)) + ledger_followup(ledger, Style(plain=True)),
+    }
+
+
+def _header(
+    host: HostInfo,
+    style: Style,
+    legend: str,
+    refreshed_at: str | None,
+    titled: bool = False,
+) -> list[str]:
     identity = [host.hostname, host.os_label]
     if host.cpus:
         identity.append(f"{host.cpus} CPUs")
@@ -525,8 +706,8 @@ def _header(host: HostInfo, style: Style, legend: str, refreshed_at: str | None)
         percent = f"\033[31m{percent}\033[0m"
     elif style.color and host.percent >= 75:
         percent = f"\033[33m{percent}\033[0m"
-    return [
-        "Running programs",
+    lines = [
+        "Where the RAM goes" if titled else "Running programs",
         style.sep.join(identity),
         (
             f"RAM in use  {memory_bar(host.percent, plain=style.plain)}  "
@@ -534,9 +715,11 @@ def _header(host: HostInfo, style: Style, legend: str, refreshed_at: str | None)
             f"{format_bytes(host.total, missing=style.missing)} ({percent})"
             f"{style.sep}{format_bytes(host.available, missing=style.missing)} available"
         ),
-        legend,
-        "",
     ]
+    if legend:
+        lines.append(legend)
+    lines.append("")
+    return lines
 
 
 def _process_footer(
@@ -553,6 +736,7 @@ def _process_footer(
     sort_field: str,
     truncated: bool,
     style: Style,
+    with_ledger: bool = False,
 ) -> list[str]:
     sort_label = SORT_LABELS.get(sort_field, sort_field)
     if grouped:
@@ -569,6 +753,8 @@ def _process_footer(
         head += f"{style.sep}{skipped} inaccessible"
     head += f"{style.sep}sorted by {sort_label}"
     lines = [head]
+    if with_ledger:
+        return lines
     if truncated:
         lines.append("Totals cover every match, including rows left out by --top.")
     if matched:

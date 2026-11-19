@@ -125,7 +125,8 @@ class CliTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(help_run.returncode, 0, help_run.stderr)
-        self.assertIn("Private WS", help_run.stdout)
+        self.assertIn("Task Manager", help_run.stdout)
+        self.assertIn("in use", help_run.stdout)
 
         module_run = subprocess.run(
             [sys.executable, "-m", "winmem", "--help"],
